@@ -1,0 +1,197 @@
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+  "Description" : "{{ ecs_stack_description | default('') }}",
+  "Parameters" : {
+    "VPC" : {
+      "Type" : "AWS::EC2::VPC::Id"
+    },
+    "KeyName" : {
+      "Type": "AWS::EC2::KeyPair::KeyName",
+      "Description": "Name of an existing EC2 KeyPair to enable SSH access to the ECS instances"
+    },
+    "HostAMI" : {
+      "Type" : "AWS::EC2::Image::Id"
+    },
+    "SubnetIDs" : {
+      "Type": "List<AWS::EC2::Subnet::Id>",
+      "Description": "List of an existing subnet IDs to use for the load balancer and auto scaling group"
+    },
+    "DesiredCapacity" : {
+      "Type": "Number",
+      "Description": "Number of instances to launch in your ECS cluster"
+    },
+    "MinCapacity" : {
+      "Type": "Number",
+      "Description": "Min number of instances that can be launched in your ECS cluster"
+    },
+    "MaxCapacity" : {
+      "Type": "Number",
+      "Description": "Maximum number of instances that can be launched in your ECS cluster"
+    },
+    "InstanceType" : {
+      "Description" : "The EC2 instance type",
+      "Type" : "String",
+      "AllowedValues" : [ "t2.nano", "t2.micro", "t2.small", "t2.medium", "m3.medium", "m3.large", "m3.xlarge", "m3.2xlarge", "c3.large", "c3.xlarge", "c3.2xlarge", "c3.4xlarge", "c3.8xlarge", "c4.large", "c4.xlarge", "c4.2xlarge", "c4.4xlarge", "c4.8xlarge", "r3.large", "r3.xlarge", "r3.2xlarge", "r3.4xlarge", "r3.8xlarge", "i2.xlarge", "i2.2xlarge", "i2.4xlarge", "i2.8xlarge", "d2.xlarge", "d2.2xlarge", "d2.4xlarge", "d2.8xlarge", "hi1.4xlarge", "hs1.8xlarge", "cr1.8xlarge", "cc2.8xlarge"
+      ],
+      "ConstraintDescription" : "must be a valid EC2 instance type."
+    },
+    "SecurityGroupIDs" : {
+      "Description" : "SecurityGroupIDs to add to cluster hosts",
+      "Type": "List<AWS::EC2::SecurityGroup::Id>"
+    },
+    "InstanceProfile" : {
+      "Description" : "InstanceProfileArn",
+      "Type": "String"
+    }
+  },
+  "Resources" : {
+    "ECSCluster" : {
+      "Type": "AWS::ECS::Cluster"
+    },
+    "ECSAutoScalingGroup" : {
+      "Type" : "AWS::AutoScaling::AutoScalingGroup",
+      "Properties" : {
+        "VPCZoneIdentifier" : { "Ref" : "SubnetIDs" },
+        "LaunchConfigurationName" : { "Ref" : "ContainerInstances" },
+        "MinSize" : { "Ref" : "MinCapacity" },
+        "MaxSize" : { "Ref" : "MaxCapacity" },
+        "DesiredCapacity" : { "Ref" : "DesiredCapacity" },
+        {% if ecs_asg_term_policies is defined %}
+        "TerminationPolicies" : [
+            {% for policy in ecs_asg_term_policies %}
+              "{{ policy }}"
+              {% if not loop.last %}, {% endif %}
+            {% endfor %}
+        ],
+        {% endif %}
+        "Tags" : [
+          {% for tag in ecs_tags.keys() %}
+            {
+              "Key" : "{{ tag }}",
+              "Value" : "{{ ecs_tags[tag] }}",
+              "PropagateAtLaunch" : true
+            }
+          {% if not loop.last %}, {% endif %}
+          {% endfor %}
+        ]
+      },
+      "CreationPolicy" : {
+        "ResourceSignal" : {
+          "Timeout" : "{{ ecs_creation_timeout }}"
+        }
+      },
+      "UpdatePolicy": {
+        "AutoScalingRollingUpdate": {
+          "MinInstancesInService": "1",
+          "MaxBatchSize": "1",
+          "PauseTime" : "{{ ecs_update_timeout }}",
+          "WaitOnResourceSignals": "true"
+        }
+      }
+    },
+    {% for policy in ecs_scaling_policies %}
+    "{{ policy.name }}" : {
+      "Type" : "AWS::AutoScaling::ScalingPolicy",
+      "Properties" : {{ policy.policy | to_json }}
+    },
+    {% endfor %}
+    "ContainerInstances": {
+      "Type": "AWS::AutoScaling::LaunchConfiguration",
+      "Metadata" : {
+        "AWS::CloudFormation::Init" : {
+          "config" : {
+            "commands" : {
+              "01_add_instance_to_cluster" : {
+                "command" : { "Fn::Join": [ "", [ "#!/bin/bash\n", "echo ECS_CLUSTER=", { "Ref": "ECSCluster" }, " >> /etc/ecs/ecs.config" ] ] }
+              }
+            },
+            "files" : {
+              "/etc/cfn/cfn-hup.conf" : {
+                "content" : { "Fn::Join" : ["", [
+                  "[main]\n",
+                  "stack=", { "Ref" : "AWS::StackId" }, "\n",
+                  "region=", { "Ref" : "AWS::Region" }, "\n"
+                ]]},
+                "mode"    : "000400",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+              "/etc/cfn/hooks.d/cfn-auto-reloader.conf" : {
+                "content": { "Fn::Join" : ["", [
+                  "[cfn-auto-reloader-hook]\n",
+                  "triggers=post.update\n",
+                  "path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init\n",
+                  "action=/usr/bin/cfn-init -v ",
+                  "         --stack ", { "Ref" : "AWS::StackName" },
+                  "         --resource ContainerInstances ",
+                  "         --region ", { "Ref" : "AWS::Region" }, "\n",
+                  "runas=root\n"
+                ]]}
+              }
+            },
+            "services" : {
+              "sysvinit" : {
+                "cfn-hup" : { "enabled" : "true", "ensureRunning" : "true", "files" : ["/etc/cfn/cfn-hup.conf", "/etc/cfn/hooks.d/cfn-auto-reloader.conf"] }
+              }
+            }
+          }
+        }
+      },
+      "Properties": {
+        "KeyName": { "Ref" : "KeyName" },
+        "ImageId" : { "Ref" : "HostAMI" },
+        "AssociatePublicIpAddress" : "{{ ecs_public_ip }}",
+        "InstanceType"   : { "Ref" : "InstanceType" },
+        "IamInstanceProfile": { "Ref": "InstanceProfile" },
+        "SecurityGroups" : { "Ref" : "SecurityGroupIDs" },
+        "UserData"       : { "Fn::Base64" : { "Fn::Join" : ["", [
+             {% if ecs_efs_id != '' %}
+             "#cloud-boothook\n",
+             "echo $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone).{{ ecs_efs_id }}.efs.{{ ecs_region }}.amazonaws.com:/    /mnt/efs  nfs4    defaults>> /etc/fstab && mkdir /mnt/efs && yum install -y nfs-utils nfs-common && mount -a\n",
+             {% endif %}
+             "#!/bin/bash -xe\n",
+             "yum install -y aws-cfn-bootstrap\n",
+             {% if ecs_use_elastic_ips is defined and ecs_use_elastic_ips == 'true'  %}
+             "yum install -y python27-pip\n",
+             "/usr/bin/pip install aws-ec2-assign-elastic-ip==0.5.0 awscli==1.10.49\n",
+             {% if ecs_eip_valid_ips is defined %}
+             "AWS_CLI=\"/usr/local/bin/aws --region ", { "Ref" : "AWS::Region" }, "\"\n",
+             "SEQ_TABLE_NAME=\"{{ ecs_eip_counter_table_name }}\"\n",
+             "SEQ_NAME=\"{{ ecs_eip_counter_name }}\"\n",
+             "seq_id=$($AWS_CLI dynamodb update-item  --table-name $SEQ_TABLE_NAME --key '{ \"counter_id\": { \"S\": \"'$SEQ_NAME'\" }}' --update-expression \"SET counter_value = counter_value + :val\" --expression-attribute-values '{ \":val\":{\"N\": \"1\"} }' --return-values \"UPDATED_NEW\" --output text --query 'Attributes.{A:counter_value}' | sed s'/^.//')\n",
+             "IFS=',' read -ra EIPS <<< '{{ ecs_eip_valid_ips }}'\n",
+             "if [[ -z \"${EIPS[$seq_id]}\" ]]; then\n",
+             "sleep 2m\n",
+             "/usr/local/bin/aws-ec2-assign-elastic-ip --valid-ips  \"{{ ecs_eip_valid_ips }}\"\n",
+             "else\n",
+             "/usr/local/bin/aws-ec2-assign-elastic-ip --valid-ips  \"${EIPS[$seq_id]}\"\n",
+             "fi\n",
+             {% else %}
+             "/usr/local/bin/aws-ec2-assign-elastic-ip \n",
+             {% endif %}
+             {% endif %}
+             "/opt/aws/bin/cfn-init -v ",
+             "         --stack ", { "Ref" : "AWS::StackName" },
+             "         --resource ContainerInstances ",
+             "         --region ", { "Ref" : "AWS::Region" }, "\n",
+
+             "/opt/aws/bin/cfn-signal -e $? ",
+             "         --stack ", { "Ref" : "AWS::StackName" },
+             "         --resource ECSAutoScalingGroup ",
+             "         --region ", { "Ref" : "AWS::Region" }, "\n"
+        ]]}}
+      }
+    }
+  },
+  "Outputs" : {
+    "ecscluster" : {
+      "Value" : { "Ref" : "ECSCluster" }
+    },
+    {% for policy in ecs_scaling_policies %}
+    "{{ policy.name }}" : {
+      "Value" : { "Ref" : "{{ policy.name }}" }
+    }
+    {% if not loop.last %}, {% endif %}
+    {% endfor %}
+  }
+}
